@@ -41,7 +41,7 @@ with st.sidebar:
         min_value=100,
         max_value=10000,
         value=500,
-        step=10,
+        step=50,
         help="Target total kilometers for the selected year.",
     )
     chart_view = st.radio(
