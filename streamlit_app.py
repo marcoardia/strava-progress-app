@@ -7,7 +7,6 @@ import requests
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-import pydeck as pdk
 
 # =========================
 # Basic setup & logging
@@ -23,7 +22,7 @@ activity_detail_url = "https://www.strava.com/api/v3/activities/{id}"
 
 st.set_page_config(page_title="Strava Progress", layout="wide")
 st.title("🎈 Strava Progress")
-st.caption("Select a year, adjust your goal, sync from Strava (incremental for current year), and explore insights. Includes a detailed last-run view with a route map.")
+st.caption("Select a year, adjust your goal, sync from Strava (incremental for current year), and explore insights. Includes a detailed last-run view (no map).")
 
 # =========================
 # Sidebar controls
@@ -133,7 +132,7 @@ def get_activities_page(token: str, page: int, per_page: int = 200,
     return data
 
 def get_activity_detail(token: str, activity_id: int | str) -> dict | None:
-    """Fetch rich details for a single activity (map polyline, HR, etc.)."""
+    """Fetch rich details for a single activity (HR, calories, speeds)."""
     try:
         headers = {"Authorization": f"Bearer {token}"}
         res = requests.get(activity_detail_url.format(id=activity_id), headers=headers, params={"include_all_efforts": "false"})
@@ -144,18 +143,12 @@ def get_activity_detail(token: str, activity_id: int | str) -> dict | None:
         return None
 
 def minimalize_act(act: dict) -> dict:
-    """Store only what we need to keep the cache compact, but rich enough for 'last run'."""
-    def get_map_polyline(a):
-        try:
-            return a.get("map", {}).get("summary_polyline")
-        except Exception:
-            return None
-
+    """Keep compact but sufficient fields (no map)."""
     return {
         "id": act.get("id"),
         "name": act.get("name"),
         "type": act.get("type"),
-        "distance": float(act.get("distance", 0.0)),
+        "distance": float(act.get("distance", 0.0)),  # meters
         "moving_time": int(act.get("moving_time", 0)) if act.get("moving_time") is not None else None,
         "elapsed_time": int(act.get("elapsed_time", 0)) if act.get("elapsed_time") is not None else None,
         "total_elevation_gain": float(act.get("total_elevation_gain", 0.0)) if act.get("total_elevation_gain") is not None else None,
@@ -165,10 +158,8 @@ def minimalize_act(act: dict) -> dict:
         "max_heartrate": float(act.get("max_heartrate", 0.0)) if act.get("max_heartrate") is not None else None,
         "kudos_count": int(act.get("kudos_count", 0)) if act.get("kudos_count") is not None else None,
         "calories": float(act.get("calories", 0.0)) if act.get("calories") is not None else None,
-        "start_latlng": act.get("start_latlng"),
         "start_date": act.get("start_date"),               # UTC ISO
         "start_date_local": act.get("start_date_local"),   # local ISO
-        "summary_polyline": get_map_polyline(act),
     }
 
 def to_epoch_utc(utc_iso: str) -> int:
@@ -177,9 +168,9 @@ def to_epoch_utc(utc_iso: str) -> int:
 
 def fetch_activities_for_year(token: str, year: int, force: bool = False):
     """
-    For the current year: incremental sync using 'after'.
-    For past years: fetch once using [after Jan 1, before Jan 1 next year].
-    Both use disk cache; 'force' bypasses and re-fetches.
+    Current year: incremental sync using 'after'.
+    Past years: fetch once using [after Jan 1, before Jan 1 next year].
+    Disk cache per year; 'force' bypasses and re-fetches.
     """
     # Load session cache for year; if empty or forced, load from disk
     if force or (year not in st.session_state["cache"]):
@@ -203,13 +194,11 @@ def fetch_activities_for_year(token: str, year: int, force: bool = False):
     activities_by_id = st.session_state["cache"][year]
     meta = st.session_state["meta"][year]
 
-    # Current year → incremental, else → full year fetch if not cached
     is_current = (year == current_year)
     need_fetch = force or (is_current) or (not activities_by_id)
 
     new_count = 0
     if need_fetch:
-        # Determine after/before
         after_epoch = meta.get("last_after_epoch", start_epoch) if is_current else start_epoch
         before_epoch = None if is_current else end_epoch
 
@@ -254,11 +243,8 @@ def fetch_activities_for_year(token: str, year: int, force: bool = False):
         else:
             st.toast(f"{year} is up to date. No new activities found.", icon="👌")
 
-    # Reflect back into session
     st.session_state["cache"][year] = activities_by_id
     st.session_state["meta"][year] = meta
-
-    # Return list of activities
     return list(activities_by_id.values())
 
 # =========================
@@ -272,22 +258,14 @@ def process_activities(activities: list, year: int) -> pd.DataFrame:
     rows = []
     for act in activities:
         if act.get("type") in ["Run", "VirtualRun"]:
-            # Parse start_date_local and strip timezone info if present
             start_local_ts = pd.to_datetime(act.get("start_date_local"), errors="coerce")
             if pd.isna(start_local_ts):
                 continue
-
-            # If tz-aware, drop timezone to make tz-naive
             if getattr(start_local_ts, "tz", None) is not None:
                 start_local_ts = start_local_ts.tz_localize(None)
-
-            # Keep only rows for the selected year (local year)
             if start_local_ts.year != year:
                 continue
-
-            # Normalize time to midnight to keep date-only granularity
             start_local_ts = start_local_ts.normalize()
-
             dist_km = float(act.get("distance", 0.0)) / 1000.0
             rows.append({"date": start_local_ts, "distance": dist_km})
 
@@ -295,28 +273,22 @@ def process_activities(activities: list, year: int) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["date", "distance"])
 
-    # Enforce tz-naive dtype for the whole column (guardrail)
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     if hasattr(df["date"].dtype, "tz") and df["date"].dtype.tz is not None:
         df["date"] = df["date"].dt.tz_localize(None)
-
     return df.groupby("date", as_index=False).sum().sort_values("date")
 
 def build_progress(df_actual: pd.DataFrame, year_goal_km: float, year: int) -> pd.DataFrame:
     df_actual = df_actual.copy()
 
-    # Ensure pandas Timestamps and strip timezone info → tz-naive
     df_actual["date"] = pd.to_datetime(df_actual["date"], errors="coerce")
     if hasattr(df_actual["date"].dtype, "tz") and df_actual["date"].dtype.tz is not None:
         df_actual["date"] = df_actual["date"].dt.tz_localize(None)
 
     start_ts = pd.Timestamp(year=year, month=1, day=1)
-    # For current year, end at today; for past years, end at Dec 31
     end_ts = pd.Timestamp(datetime.now().date()) if year == current_year else pd.Timestamp(year=year, month=12, day=31)
 
-    # Goal date range (tz-naive)
     date_range = pd.date_range(start=start_ts, end=end_ts, freq="D")
-
     year_end_ts = pd.Timestamp(year=year, month=12, day=31)
     days_in_year = (year_end_ts - start_ts).days + 1
 
@@ -325,7 +297,6 @@ def build_progress(df_actual: pd.DataFrame, year_goal_km: float, year: int) -> p
     df_goal["goal_cum"] = (df_goal["day_number"] / days_in_year) * year_goal_km
     df_goal["goal"] = df_goal["goal_cum"].diff().fillna(df_goal["goal_cum"])
 
-    # Now both 'date' columns are tz-naive → safe to merge
     df_full = pd.merge(df_goal, df_actual, how="left", on="date")
     df_full["distance"] = pd.to_numeric(df_full["distance"], errors="coerce").fillna(0.0)
 
@@ -335,10 +306,10 @@ def build_progress(df_actual: pd.DataFrame, year_goal_km: float, year: int) -> p
     return df_full
 
 # =========================
-# Utilities for last-run section
+# Utilities (last-run KPIs & pace)
 # =========================
 def fmt_secs(s: int | float | None) -> str:
-    if s is None:
+    if not s and s != 0:
         return "—"
     s = int(s)
     h = s // 3600
@@ -346,140 +317,36 @@ def fmt_secs(s: int | float | None) -> str:
     sec = s % 60
     return f"{h:d}:{m:02d}:{sec:02d}" if h > 0 else f"{m:d}:{sec:02d}"
 
-def pace_str(moving_time_s: int | float | None, dist_km: float | None) -> str:
-    if not moving_time_s or not dist_km or dist_km <= 0:
-        return "—"
-    sec_per_km = moving_time_s / dist_km
-    m = int(sec_per_km // 60)
-    s = int(round(sec_per_km % 60))
-    return f"{m}:{s:02d} /km"
+def pace_tuple(moving_time_s: int | float | None, distance_m: float | None):
+    """
+    Returns (pace_sec_per_km, pace_min_decimal, pace_mmss_str)
+    """
+    if not moving_time_s or not distance_m or distance_m <= 0:
+        return None, None, "—"
+    dist_km = distance_m / 1000.0
+    pace_sec_per_km = moving_time_s / dist_km
+    pace_min_decimal = pace_sec_per_km / 60.0
+    m = int(pace_sec_per_km // 60)
+    s = int(round(pace_sec_per_km % 60))
+    if s == 60:
+        m += 1
+        s = 0
+    pace_mmss = f"{m}:{s:02d} /km"
+    return pace_sec_per_km, pace_min_decimal, pace_mmss
 
 def kmh(speed_mps: float | None) -> float | None:
     if speed_mps is None:
         return None
     return speed_mps * 3.6
 
-def decode_polyline(polyline_str: str):
-    """Decode a Google/Strava encoded polyline into a list of (lat, lng)."""
-    if not polyline_str:
-        return []
-    coords = []
-    index = lat = lng = 0
-    length = len(polyline_str)
-
-    while index < length:
-        result = 1
-        shift = 0
-        b = 0
-        while True:
-            b = ord(polyline_str[index]) - 63 - 1
-            index += 1
-            result += b << shift
-            shift += 5
-            if b < 0x1f:
-                break
-        dlat = ~(result >> 1) if (result & 1) else (result >> 1)
-        lat += dlat
-
-        result = 1
-        shift = 0
-        while True:
-            b = ord(polyline_str[index]) - 63 - 1
-            index += 1
-            result += b << shift
-            shift += 5
-            if b < 0x1f:
-                break
-        dlng = ~(result >> 1) if (result & 1) else (result >> 1)
-        lng += dlng
-
-        coords.append((lat * 1e-5, lng * 1e-5))
-    return coords
-
-def render_route_map(summary_polyline: str | None, start_latlng: list | None):
-    if summary_polyline:
-        coords = decode_polyline(summary_polyline)
-        if len(coords) >= 2:
-            # PathLayer for route line
-            path_data = [{"path": [{"lat": lat, "lon": lon} for (lat, lon) in coords]}]
-            midpoint = coords[len(coords) // 2]
-            view_state = pdk.ViewState(latitude=midpoint[0], longitude=midpoint[1], zoom=12, pitch=0)
-            layer_path = pdk.Layer(
-                "PathLayer",
-                data=path_data,
-                get_path="path",
-                get_width=5,
-                width_min_pixels=2,
-                get_color=[255, 77, 0],  # orange-red
-                opacity=0.7,
-            )
-            # Start & finish markers
-            markers = [
-                {"lat": coords[0][0], "lon": coords[0][1], "label": "Start"},
-                {"lat": coords[-1][0], "lon": coords[-1][1], "label": "Finish"},
-            ]
-            layer_pts = pdk.Layer(
-                "ScatterplotLayer",
-                data=markers,
-                get_position='[lon, lat]',
-                get_fill_color=[30, 144, 255],
-                get_radius=30,
-            )
-            r = pdk.Deck(layers=[layer_path, layer_pts], initial_view_state=view_state, map_style="mapbox://styles/mapbox/outdoors-v12")
-            st.pydeck_chart(r, use_container_width=True)
-            return
-    # Fallback: show start point if available
-    if start_latlng and len(start_latlng) == 2:
-        df = pd.DataFrame([{"lat": start_latlng[0], "lon": start_latlng[1]}])
-        st.map(df, use_container_width=True)
-    else:
-        st.info("No route map available for this activity.")
-
-def enrich_activity_if_needed(token: str, act: dict) -> dict:
-    """
-    Ensure we have rich fields for the last run: moving_time, elev, hr, summary_polyline.
-    If missing, try to fetch activity detail once.
-    """
-    need_detail = any([
-        act.get("moving_time") in (None, 0),
-        act.get("total_elevation_gain") in (None, 0),
-        not act.get("summary_polyline"),
-        act.get("average_heartrate") in (None, 0),
-    ])
-    if not need_detail:
-        return act
-
-    detail = get_activity_detail(token, act.get("id"))
-    if not detail:
-        return act
-
-    # Merge selected fields
-    merge_fields = {
-        "name": detail.get("name"),
-        "moving_time": detail.get("moving_time"),
-        "elapsed_time": detail.get("elapsed_time"),
-        "total_elevation_gain": detail.get("total_elevation_gain"),
-        "average_speed": detail.get("average_speed"),
-        "max_speed": detail.get("max_speed"),
-        "average_heartrate": detail.get("average_heartrate"),
-        "max_heartrate": detail.get("max_heartrate"),
-        "kudos_count": detail.get("kudos_count"),
-        "calories": detail.get("calories"),
-        "summary_polyline": detail.get("map", {}).get("summary_polyline"),
-        "start_latlng": detail.get("start_latlng"),
-    }
-    act.update({k: v for k, v in merge_fields.items() if v is not None})
-    return act
-
 # =========================
-# Visualization
+# Visualization (chart)
 # =========================
 def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year: int):
     if df_progress.empty:
         st.info("No data to display yet.")
         return
 
-    # Guardrail: ensure tz-naive in the plotted frame
     df_progress = df_progress.copy()
     df_progress["date"] = pd.to_datetime(df_progress["date"], errors="coerce")
     if hasattr(df_progress["date"].dtype, "tz") and df_progress["date"].dtype.tz is not None:
@@ -507,38 +374,18 @@ def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year
     bar_colors = ["#2ca02c" if float(v) >= 0 else "#d62728" for v in bar_series]
 
     fig = go.Figure()
-
-    # Bars for difference
-    fig.add_trace(
-        go.Bar(
-            x=df_progress["date"],
-            y=bar_series,
-            name=bar_name,
-            marker_color=bar_colors,
-            opacity=0.5,
-        )
-    )
-    # Goal line
-    fig.add_trace(
-        go.Scatter(
-            x=df_progress["date"],
-            y=line_goal,
-            name=line_goal_name,
-            mode="lines",
-            line=dict(color="#6c757d", width=2, dash="dash"),
-        )
-    )
-    # Actual line
-    fig.add_trace(
-        go.Scatter(
-            x=df_progress["date"],
-            y=line_actual,
-            name=line_actual_name,
-            mode="lines",
-            line=dict(color="#1f77b4", width=3),
-        )
-    )
-
+    fig.add_trace(go.Bar(
+        x=df_progress["date"], y=bar_series, name=bar_name,
+        marker_color=bar_colors, opacity=0.5
+    ))
+    fig.add_trace(go.Scatter(
+        x=df_progress["date"], y=line_goal, name=line_goal_name,
+        mode="lines", line=dict(color="#6c757d", width=2, dash="dash")
+    ))
+    fig.add_trace(go.Scatter(
+        x=df_progress["date"], y=line_actual, name=line_actual_name,
+        mode="lines", line=dict(color="#1f77b4", width=3)
+    ))
     fig.update_layout(
         barmode="overlay",
         xaxis=dict(title="Date", type="date"),
@@ -546,21 +393,44 @@ def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=40, r=20, t=40, b=40),
         hovermode="x unified",
-        shapes=[
-            dict(
-                type="line",
-                xref="paper", x0=0, x1=1,
-                yref="y", y0=0, y1=0,
-                line=dict(color="#cccccc", width=1),
-            )
-        ],
+        shapes=[dict(type="line", xref="paper", x0=0, x1=1, yref="y", y0=0, y1=0, line=dict(color="#cccccc", width=1))]
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Last run (rich) section
+# Last run (rich, no map)
 # =========================
+def enrich_activity_if_needed(token: str, act: dict) -> dict:
+    """
+    Ensure we have rich fields for the last run: moving_time, elev, hr, etc.
+    If missing, try to fetch activity detail once.
+    """
+    need_detail = any([
+        act.get("moving_time") in (None, 0),
+        act.get("total_elevation_gain") in (None, 0),
+        act.get("average_heartrate") in (None, 0),
+        act.get("calories") in (None, 0),
+    ])
+    if not need_detail:
+        return act
+    detail = get_activity_detail(token, act.get("id"))
+    if not detail:
+        return act
+    merge_fields = {
+        "name": detail.get("name"),
+        "moving_time": detail.get("moving_time"),
+        "elapsed_time": detail.get("elapsed_time"),
+        "total_elevation_gain": detail.get("total_elevation_gain"),
+        "average_speed": detail.get("average_speed"),
+        "max_speed": detail.get("max_speed"),
+        "average_heartrate": detail.get("average_heartrate"),
+        "max_heartrate": detail.get("max_heartrate"),
+        "kudos_count": detail.get("kudos_count"),
+        "calories": detail.get("calories"),
+    }
+    act.update({k: v for k, v in merge_fields.items() if v is not None})
+    return act
+
 def render_last_run_section(token: str, activities: list, year: int):
     # Filter runs for selected year and get the most recent by start_date_local
     run_acts = []
@@ -575,21 +445,19 @@ def render_last_run_section(token: str, activities: list, year: int):
         if ts.year == year:
             run_acts.append((ts, a))
 
+    st.subheader("Last run")
     if not run_acts:
-        st.subheader("Last run")
         st.info(f"No runs found for {year}.")
         return
 
-    # Most recent run this year
     run_acts.sort(key=lambda t: t[0])
     last_ts, last = run_acts[-1]
-
-    # Enrich if needed (HR, polyline, etc.)
     last = enrich_activity_if_needed(token, last)
 
     # Extract fields
     name = last.get("name") or "Run"
-    distance_km = (float(last.get("distance") or 0.0) / 1000.0)
+    distance_m = float(last.get("distance") or 0.0)
+    distance_km = distance_m / 1000.0 if distance_m else 0.0
     moving_s = last.get("moving_time")
     elapsed_s = last.get("elapsed_time")
     elev_gain = last.get("total_elevation_gain")
@@ -599,17 +467,16 @@ def render_last_run_section(token: str, activities: list, year: int):
     max_hr = last.get("max_heartrate")
     kudos = last.get("kudos_count")
     calories = last.get("calories")
-    poly = last.get("summary_polyline")
-    start_latlng = last.get("start_latlng")
 
-    st.subheader("Last run")
+    pace_sec_per_km, pace_min_dec, pace_mmss = pace_tuple(moving_s, distance_m)
+
     st.write(f"**{name}** — {last_ts.strftime('%Y-%m-%d %H:%M')}")
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Distance", f"{distance_km:.2f} km")
     k2.metric("Moving time", fmt_secs(moving_s))
     k3.metric("Elapsed", fmt_secs(elapsed_s))
-    k4.metric("Pace", pace_str(moving_s, distance_km))
+    k4.metric("Pace", pace_mmss)
 
     k5, k6, k7, k8 = st.columns(4)
     k5.metric("Avg speed", f"{avg_speed_kmh:.1f} km/h" if avg_speed_kmh is not None else "—")
@@ -621,43 +488,49 @@ def render_last_run_section(token: str, activities: list, year: int):
     k9.metric("Avg HR", f"{avg_hr:.0f} bpm" if avg_hr else "—")
     k10.metric("Max HR", f"{max_hr:.0f} bpm" if max_hr else "—")
     k11.metric("Calories", f"{calories:.0f} kcal" if calories else "—")
-    # show start local time nicely
     k12.metric("Started", last_ts.strftime("%a %d %b %Y • %H:%M"))
 
-    # Gauges (cool graphics)
-    # Pace gauge: set scale relative to 3:00–8:00 /km (adjust to your preference)
-    fig_pace = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=(moving_s / distance_km / 60) if (moving_s and distance_km) else 0,
-        number={'suffix': " min/km", 'valueformat': ".2f"},
-        gauge={
-            'axis': {'range': [3.0, 8.0]},
-            'bar': {'color': "#1f77b4"},
-            'steps': [
-                {'range': [3.0, 4.5], 'color': '#b6e3ff'},
-                {'range': [4.5, 6.0], 'color': '#d5f5e3'},
-                {'range': [6.0, 8.0], 'color': '#ffd6cc'}
-            ]
-        },
-        title={'text': "Pace"}
-    ))
-    fig_speed = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=avg_speed_kmh or 0,
-        number={'suffix': " km/h", 'valueformat': ".1f"},
-        gauge={
-            'axis': {'range': [0, max(12, (avg_speed_kmh or 0) + 2)]},
-            'bar': {'color': "#ff7f0e"},
-        },
-        title={'text': "Avg speed"}
-    ))
+    # Gauges (pace and speed)
     c_g1, c_g2 = st.columns(2)
-    c_g1.plotly_chart(fig_pace, use_container_width=True)
-    c_g2.plotly_chart(fig_speed, use_container_width=True)
 
-    # Route map
-    st.caption("Route")
-    render_route_map(poly, start_latlng)
+    # Pace gauge — value in MINUTES per km (correct), dynamic axis around value
+    if pace_min_dec is not None:
+        lower = max(3.0, round(pace_min_dec - 2.0, 1))
+        upper = max(lower + 3.0, round(pace_min_dec + 2.0, 1))
+        fig_pace = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=pace_min_dec,  # minutes per km as decimal (correct numeric)
+            number={'suffix': " min/km", 'valueformat': ".2f"},
+            gauge={
+                'axis': {'range': [lower, upper]},
+                'bar': {'color': "#1f77b4"},
+                'steps': [
+                    {'range': [lower, (lower+upper)/2], 'color': '#d5f5e3'},
+                    {'range': [(lower+upper)/2, upper], 'color': '#ffd6cc'}
+                ]
+            },
+            title={'text': f"Pace (also shown as {pace_mmss})"}
+        ))
+        c_g1.plotly_chart(fig_pace, use_container_width=True)
+    else:
+        c_g1.info("Pace gauge: not enough data")
+
+    # Avg speed gauge (km/h)
+    if avg_speed_kmh is not None:
+        s_upper = max(12.0, round(avg_speed_kmh + 2.0, 1))
+        fig_speed = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=avg_speed_kmh,
+            number={'suffix': " km/h", 'valueformat': ".1f"},
+            gauge={
+                'axis': {'range': [0, s_upper]},
+                'bar': {'color': "#ff7f0e"},
+            },
+            title={'text': "Avg speed"}
+        ))
+        c_g2.plotly_chart(fig_speed, use_container_width=True)
+    else:
+        c_g2.info("Speed gauge: not enough data")
 
 # =========================
 # Analysis section
@@ -720,7 +593,6 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
                 streak = 1
         best_streak = max(best_streak, streak)
 
-        # current streak for selected year (ends at last date in that year)
         last_date = dates_with_run[-1]
         if year == current_year and last_date == datetime.now().date():
             cs = 1
@@ -733,7 +605,7 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
         else:
             current_streak = 0
 
-    # Required pace to hit goal from "now" (for past years, 0 remaining)
+    # Required pace to hit goal
     start_year = pd.Timestamp(year=year, month=1, day=1)
     end_year = pd.Timestamp(year=year, month=12, day=31)
     days_in_year = (end_year - start_year).days + 1
@@ -764,7 +636,7 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
     c7.metric("Current streak", f"{current_streak} days")
     c8.metric("Req. avg/day to hit goal", f"{required_avg_per_day:.2f} km")
 
-    # Weekday distribution (sum of km by weekday)
+    # Weekday distribution
     df_weekday = df_progress.copy()
     df_weekday["weekday"] = pd.to_datetime(df_weekday["date"]).dt.day_name()
     weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -775,44 +647,15 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
         .reindex(weekday_order, fill_value=0)
         .reset_index()
     )
-
-    fig_wd = go.Figure(
-        data=[
-            go.Bar(
-                x=df_weekday["weekday"],
-                y=df_weekday["distance"],
-                marker_color="#4e79a7",
-                name="KM",
-            )
-        ]
-    )
-    fig_wd.update_layout(
-        title="Distance by Weekday",
-        xaxis_title="Weekday",
-        yaxis_title="Kilometers",
-        margin=dict(l=40, r=20, t=40, b=40),
-    )
+    fig_wd = go.Figure([go.Bar(x=df_weekday["weekday"], y=df_weekday["distance"], marker_color="#4e79a7", name="KM")])
+    fig_wd.update_layout(title="Distance by Weekday", xaxis_title="Weekday", yaxis_title="Kilometers", margin=dict(l=40, r=20, t=40, b=40))
 
     # Monthly totals
     df_month = df_progress.copy()
     df_month["month"] = pd.to_datetime(df_month["date"]).dt.to_period("M").astype(str)
     df_month = df_month.groupby("month", as_index=False)["distance"].sum()
-    fig_mo = go.Figure(
-        data=[
-            go.Bar(
-                x=df_month["month"],
-                y=df_month["distance"],
-                marker_color="#59a14f",
-                name="KM",
-            )
-        ]
-    )
-    fig_mo.update_layout(
-        title="Monthly Totals",
-        xaxis_title="Month",
-        yaxis_title="Kilometers",
-        margin=dict(l=40, r=20, t=40, b=40),
-    )
+    fig_mo = go.Figure([go.Bar(x=df_month["month"], y=df_month["distance"], marker_color="#59a14f", name="KM")])
+    fig_mo.update_layout(title="Monthly Totals", xaxis_title="Month", yaxis_title="Kilometers", margin=dict(l=40, r=20, t=40, b=40))
 
     c9, c10 = st.columns(2)
     c9.plotly_chart(fig_wd, use_container_width=True)
@@ -844,7 +687,7 @@ def run():
             ts = datetime.fromisoformat(last_synced).astimezone()
             st.caption(f"Last synced: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-        # === Last run section (rich) ===
+        # === Last run section (rich, no map) ===
         render_last_run_section(token, activities, YEAR_SELECTED)
 
         # Chart
