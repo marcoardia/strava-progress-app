@@ -22,7 +22,7 @@ activity_detail_url = "https://www.strava.com/api/v3/activities/{id}"
 
 st.set_page_config(page_title="Strava Progress", layout="wide")
 st.title("🎈 Strava Progress")
-st.caption("Select a year, adjust your goal, sync from Strava (incremental for current year), and explore insights. Now with detailed last-run rankings vs this year.")
+st.caption("Select a year, adjust your goal, sync from Strava (incremental for current year), and explore insights. Includes correct last-run rankings vs this year.")
 
 # =========================
 # Sidebar controls
@@ -41,7 +41,7 @@ with st.sidebar:
         "Yearly goal (km)",
         min_value=100,
         max_value=10000,
-        value=1000,  # default changed to 1000
+        value=1000,  # default 1000 km
         step=10,
         help="Target total kilometers for the selected year.",
     )
@@ -132,7 +132,7 @@ def get_activities_page(token: str, page: int, per_page: int = 200,
     return data
 
 def get_activity_detail(token: str, activity_id: int | str) -> dict | None:
-    """Fetch richer details for a single activity if needed (HR, calories, speeds)."""
+    """Fetch richer details for a single activity if needed (HR, calories, speeds, moving_time, elevation)."""
     try:
         headers = {"Authorization": f"Bearer {token}"}
         res = requests.get(activity_detail_url.format(id=activity_id), headers=headers, params={"include_all_efforts": "false"})
@@ -247,6 +247,65 @@ def fetch_activities_for_year(token: str, year: int, force: bool = False):
     return list(activities_by_id.values())
 
 # =========================
+# Backfill missing metrics for ranking (key fix)
+# =========================
+RANK_FIELDS = ["moving_time", "average_speed"]  # we compute pace from moving_time+distance; elev is often zero but valid
+
+def backfill_metrics_for_selected_year(token: str, year: int, max_details: int = 50):
+    """
+    Some cached runs may lack fields needed for ranking (e.g., moving_time, average_speed).
+    We fetch details for those runs only (up to max_details) and persist updates to disk cache.
+    """
+    activities_by_id = st.session_state["cache"].get(year, {})
+    if not activities_by_id:
+        return
+
+    # Collect IDs in selected year with missing key fields
+    needs = []
+    for aid, a in activities_by_id.items():
+        if a.get("type") not in ["Run", "VirtualRun"]:
+            continue
+        ts = pd.to_datetime(a.get("start_date_local"), errors="coerce")
+        if pd.isna(ts):
+            continue
+        if getattr(ts, "tz", None) is not None:
+            ts = ts.tz_localize(None)
+        if ts.year != year:
+            continue
+        if any(a.get(f) in (None,) for f in RANK_FIELDS):
+            needs.append(aid)
+
+    if not needs:
+        return
+
+    # Limit calls to be nice to the API
+    needs = needs[:max_details]
+    with st.spinner(f"🔧 Backfilling missing metrics for {len(needs)} run(s)…"):
+        updated = 0
+        for aid in needs:
+            detail = get_activity_detail(token, aid)
+            if not detail:
+                continue
+            a = activities_by_id[aid]
+            # Merge only relevant fields
+            for k in [
+                "moving_time", "elapsed_time", "total_elevation_gain",
+                "average_speed", "max_speed",
+                "average_heartrate", "max_heartrate", "kudos_count", "calories", "name"
+            ]:
+                v = detail.get(k)
+                if v is not None:
+                    a[k] = v
+            activities_by_id[aid] = a
+            updated += 1
+
+        st.session_state["cache"][year] = activities_by_id
+        # Save back to disk
+        meta = st.session_state["meta"].get(year, {})
+        save_cache_to_disk(year, activities_by_id, meta)
+    st.toast("✅ Metrics backfilled for ranking.", icon="✅")
+
+# =========================
 # Transformations (tz-naive dates)
 # =========================
 def process_activities(activities: list, year: int) -> pd.DataFrame:
@@ -339,6 +398,8 @@ def kmh(speed_mps: float | None) -> float | None:
     return speed_mps * 3.6
 
 def ordinal(n: int) -> str:
+    if n is None:
+        return "—"
     if 10 <= n % 100 <= 20:
         suffix = "th"
     else:
@@ -404,7 +465,7 @@ def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Last run (rich, no map) + Rankings vs year
+# Last run (with rankings vs year)
 # =========================
 def get_runs_for_year(activities: list, year: int):
     """Return list of dicts for runs in selected year with computed metrics."""
@@ -441,27 +502,37 @@ def get_runs_for_year(activities: list, year: int):
     return runs
 
 def rank_metric(runs: list, key: str, value, higher_is_better: bool = True):
-    """Return 1-based rank and total N; ignores None values."""
-    vals = [r[key] for r in runs if r.get(key) is not None]
-    vals = [v for v in vals if not (isinstance(v, (int, float)) and pd.isna(v))]
-    if not vals or value is None or (isinstance(value, (int, float)) and pd.isna(value)):
-        return None, len(vals)
+    """
+    1-based rank and total N using only runs with a valid, non-null metric.
+    For pace (seconds per km), lower is better → higher_is_better=False
+    """
+    def valid(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return False
+        # forbid zero/negatives for time/pace where nonsensical
+        if key in ("pace_sec", "moving_time") and (not isinstance(v, (int, float)) or v <= 0):
+            return False
+        # elevation can be zero and is valid
+        return True
+
+    vals = [r[key] for r in runs if valid(r.get(key))]
+    total = len(vals)
+    if total == 0 or not valid(value):
+        return None, total
+
     vals_sorted = sorted(vals, reverse=higher_is_better)
-    # For float comparisons, find first index within tolerance
+    # Find stable rank (handle floats close-equality)
     try:
-        # exact index
         idx = vals_sorted.index(value)
     except ValueError:
-        # find closest index
         diffs = [abs(v - value) for v in vals_sorted]
         idx = int(pd.Series(diffs).idxmin())
     rank = idx + 1
-    return rank, len(vals)
+    return rank, total
 
 def percentile_from_rank(rank: int | None, total: int) -> float | None:
     if not rank or total <= 0:
         return None
-    # top %: rank 1 → ~0%, rank N → 100%
     return (rank / total) * 100.0
 
 def get_last_run_for_year(runs: list):
@@ -474,11 +545,11 @@ def enrich_activity_if_needed(token: str, act: dict) -> dict:
     """Bring in more fields for last run if missing."""
     need_detail = any([
         act.get("moving_time") in (None, 0),
-        act.get("total_elevation_gain") in (None, 0),
         act.get("average_speed") in (None, 0),
         act.get("calories") in (None, 0),
         act.get("average_heartrate") in (None, 0),
         act.get("max_heartrate") in (None, 0),
+        # elevation can be zero and still valid; don't fetch just for that
     ])
     if not need_detail:
         return act
@@ -508,14 +579,26 @@ def render_last_run_section(token: str, activities: list, year: int):
         st.info(f"No runs found for {year}.")
         return
 
+    # Enrich ALL runs that miss core metrics for ranking (if any remain after backfill)
+    # This keeps the ranks accurate even if some older cache entries lacked fields.
+    missing_core = [r for r in runs if r.get("moving_time") in (None, 0) or r.get("pace_sec") in (None, 0)]
+    if missing_core:
+        backfill_metrics_for_selected_year(token, year)
+        # Rebuild runs after backfill
+        activities = list(st.session_state["cache"].get(year, {}).values())
+        runs = get_runs_for_year(activities, year)
+
     last = get_last_run_for_year(runs)
-    # Enrich the underlying activity if needed and update the last dict
-    # (find the same activity in raw activities to fetch detail)
+
+    # Also enrich the specific last run if needed (to show richer KPIs)
     last_raw = next((a for a in activities if a.get("id") == last["id"]), None)
     if last_raw:
         last_raw = enrich_activity_if_needed(token, last_raw)
-        # Recompute pace if moving time was filled by detail
-        pace_sec, pace_min_dec, pace_mmss = pace_tuple(last_raw.get("moving_time"), last_raw.get("distance"))
+        # persist enrichment
+        st.session_state["cache"][year][str(last_raw["id"])] = last_raw
+        save_cache_to_disk(year, st.session_state["cache"][year], st.session_state["meta"].get(year, {}))
+        # Recompute pace/time in 'last' view
+        pace_sec, _, pace_mmss = pace_tuple(last_raw.get("moving_time"), last_raw.get("distance"))
         last.update({
             "name": last_raw.get("name") or last.get("name"),
             "moving_time": last_raw.get("moving_time") or last.get("moving_time"),
@@ -530,7 +613,7 @@ def render_last_run_section(token: str, activities: list, year: int):
 
     # Primary KPIs
     distance_km = last["distance_m"] / 1000.0 if last.get("distance_m") else 0.0
-    pace_sec, pace_min_dec, pace_mmss = pace_tuple(last.get("moving_time"), last.get("distance_m"))
+    pace_sec, _, pace_mmss = pace_tuple(last.get("moving_time"), last.get("distance_m"))
 
     st.write(f"**{last.get('name') or 'Run'}** — {last['ts'].strftime('%Y-%m-%d %H:%M')}")
 
@@ -547,12 +630,12 @@ def render_last_run_section(token: str, activities: list, year: int):
     k7.metric("Max HR", f"{(last.get('max_hr') or 0):.0f} bpm" if last.get("max_hr") else "—")
     k8.metric("Calories", f"{(last.get('calories') or 0):.0f} kcal" if last.get("calories") else "—")
 
-    # ---- Rankings vs this year ----
+    # ---- Rankings vs this year (corrected) ----
     st.markdown("### Compared to this year")
 
-    # Compute ranks
+    # compute ranks on the latest runs list
     rank_dist, n_dist = rank_metric(runs, "distance_m", last.get("distance_m"), higher_is_better=True)
-    rank_pace, n_pace = rank_metric(runs, "pace_sec", last.get("pace_sec"), higher_is_better=False)  # lower is better
+    rank_pace, n_pace = rank_metric(runs, "pace_sec", last.get("pace_sec"), higher_is_better=False)  # lower pace = better
     rank_elev, n_elev = rank_metric(runs, "elev", last.get("elev"), higher_is_better=True)
     rank_time, n_time = rank_metric(runs, "moving_time", last.get("moving_time"), higher_is_better=True)
 
@@ -726,6 +809,12 @@ def run():
         activities = fetch_activities_for_year(token, YEAR_SELECTED, force=force_refresh)
         log_success(f"Cached activities for {YEAR_SELECTED}: {len(activities)}")
 
+        # NEW: backfill missing metrics used for rankings if needed (once per year)
+        backfill_metrics_for_selected_year(token, YEAR_SELECTED)
+
+        # Refresh activities after backfill so downstream sees updated values
+        activities = list(st.session_state["cache"].get(YEAR_SELECTED, {}).values())
+
         st.write("🧮 Processing runs…")
         df_activities = process_activities(activities, YEAR_SELECTED)
         df_progress = build_progress(df_activities, YEAR_GOAL_KM, YEAR_SELECTED)
@@ -736,7 +825,7 @@ def run():
             ts = datetime.fromisoformat(last_synced).astimezone()
             st.caption(f"Last synced: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-        # === Last run section (with rankings vs year) ===
+        # === Last run section (with correct rankings) ===
         render_last_run_section(token, activities, YEAR_SELECTED)
 
         # Chart
