@@ -19,6 +19,7 @@ def log_error(msg): print(msg)
 auth_url = "https://www.strava.com/oauth/token"
 activities_url = "https://www.strava.com/api/v3/athlete/activities"
 activity_detail_url = "https://www.strava.com/api/v3/activities/{id}"
+curdir = os.path.dirname(os.path.realpath(__file__))
 
 st.set_page_config(page_title="Strava Progress", layout="wide")
 
@@ -31,7 +32,9 @@ def render_header():
         "https://images.unsplash.com/photo-1546483875-ad9014c88eba"
         "?auto=format&fit=crop&w=1600&q=60"
     )
-    header_image_url = st.secrets.get("header_image_url", default_header_img)
+    img = curdir + "/" + st.secrets["header_image_url"]
+    #header_image_url = st.secrets.get("header_image_url", default_header_img)
+    header_image_url = img
 
     # Stylish header with image on the left and title/subtitle on the right
     hcol_img, hcol_txt = st.columns([1, 3])
