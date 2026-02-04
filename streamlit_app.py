@@ -22,7 +22,7 @@ activity_detail_url = "https://www.strava.com/api/v3/activities/{id}"
 
 st.set_page_config(page_title="Strava Progress", layout="wide")
 st.title("🎈 Strava Progress")
-st.caption("Select a year, adjust your goal, sync from Strava (incremental for current year), and explore insights. Includes a detailed last-run view (no map).")
+st.caption("Select a year, adjust your goal, sync from Strava (incremental for current year), and explore insights. Now with detailed last-run rankings vs this year.")
 
 # =========================
 # Sidebar controls
@@ -41,7 +41,7 @@ with st.sidebar:
         "Yearly goal (km)",
         min_value=100,
         max_value=10000,
-        value=1000,
+        value=1000,  # default changed to 1000
         step=10,
         help="Target total kilometers for the selected year.",
     )
@@ -132,7 +132,7 @@ def get_activities_page(token: str, page: int, per_page: int = 200,
     return data
 
 def get_activity_detail(token: str, activity_id: int | str) -> dict | None:
-    """Fetch rich details for a single activity (HR, calories, speeds)."""
+    """Fetch richer details for a single activity if needed (HR, calories, speeds)."""
     try:
         headers = {"Authorization": f"Bearer {token}"}
         res = requests.get(activity_detail_url.format(id=activity_id), headers=headers, params={"include_all_efforts": "false"})
@@ -143,7 +143,7 @@ def get_activity_detail(token: str, activity_id: int | str) -> dict | None:
         return None
 
 def minimalize_act(act: dict) -> dict:
-    """Keep compact but sufficient fields (no map)."""
+    """Compact but sufficient fields (no map)."""
     return {
         "id": act.get("id"),
         "name": act.get("name"),
@@ -163,7 +163,6 @@ def minimalize_act(act: dict) -> dict:
     }
 
 def to_epoch_utc(utc_iso: str) -> int:
-    # Accept both Z and +00:00 forms
     return int(datetime.fromisoformat(utc_iso.replace("Z", "+00:00")).timestamp())
 
 def fetch_activities_for_year(token: str, year: int, force: bool = False):
@@ -306,7 +305,7 @@ def build_progress(df_actual: pd.DataFrame, year_goal_km: float, year: int) -> p
     return df_full
 
 # =========================
-# Utilities (last-run KPIs & pace)
+# Utilities (time/pace/ordinal)
 # =========================
 def fmt_secs(s: int | float | None) -> str:
     if not s and s != 0:
@@ -338,6 +337,13 @@ def kmh(speed_mps: float | None) -> float | None:
     if speed_mps is None:
         return None
     return speed_mps * 3.6
+
+def ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
 
 # =========================
 # Visualization (chart)
@@ -398,18 +404,81 @@ def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Last run (rich, no map)
+# Last run (rich, no map) + Rankings vs year
 # =========================
+def get_runs_for_year(activities: list, year: int):
+    """Return list of dicts for runs in selected year with computed metrics."""
+    runs = []
+    for a in activities:
+        if a.get("type") not in ["Run", "VirtualRun"]:
+            continue
+        ts = pd.to_datetime(a.get("start_date_local"), errors="coerce")
+        if pd.isna(ts):
+            continue
+        if getattr(ts, "tz", None) is not None:
+            ts = ts.tz_localize(None)
+        if ts.year != year:
+            continue
+        distance_m = float(a.get("distance") or 0.0)
+        moving_time = a.get("moving_time")
+        elev = a.get("total_elevation_gain")
+        avg_speed = a.get("average_speed")
+        pace_sec, pace_min_dec, _ = pace_tuple(moving_time, distance_m)
+        runs.append({
+            "id": a.get("id"),
+            "ts": ts,
+            "name": a.get("name"),
+            "distance_m": distance_m,
+            "moving_time": moving_time,
+            "elev": elev,
+            "avg_speed": avg_speed,
+            "pace_sec": pace_sec,
+            "avg_hr": a.get("average_heartrate"),
+            "max_hr": a.get("max_heartrate"),
+            "kudos": a.get("kudos_count"),
+            "calories": a.get("calories"),
+        })
+    return runs
+
+def rank_metric(runs: list, key: str, value, higher_is_better: bool = True):
+    """Return 1-based rank and total N; ignores None values."""
+    vals = [r[key] for r in runs if r.get(key) is not None]
+    vals = [v for v in vals if not (isinstance(v, (int, float)) and pd.isna(v))]
+    if not vals or value is None or (isinstance(value, (int, float)) and pd.isna(value)):
+        return None, len(vals)
+    vals_sorted = sorted(vals, reverse=higher_is_better)
+    # For float comparisons, find first index within tolerance
+    try:
+        # exact index
+        idx = vals_sorted.index(value)
+    except ValueError:
+        # find closest index
+        diffs = [abs(v - value) for v in vals_sorted]
+        idx = int(pd.Series(diffs).idxmin())
+    rank = idx + 1
+    return rank, len(vals)
+
+def percentile_from_rank(rank: int | None, total: int) -> float | None:
+    if not rank or total <= 0:
+        return None
+    # top %: rank 1 → ~0%, rank N → 100%
+    return (rank / total) * 100.0
+
+def get_last_run_for_year(runs: list):
+    if not runs:
+        return None
+    runs_sorted = sorted(runs, key=lambda r: r["ts"])
+    return runs_sorted[-1]
+
 def enrich_activity_if_needed(token: str, act: dict) -> dict:
-    """
-    Ensure we have rich fields for the last run: moving_time, elev, hr, etc.
-    If missing, try to fetch activity detail once.
-    """
+    """Bring in more fields for last run if missing."""
     need_detail = any([
         act.get("moving_time") in (None, 0),
         act.get("total_elevation_gain") in (None, 0),
-        act.get("average_heartrate") in (None, 0),
+        act.get("average_speed") in (None, 0),
         act.get("calories") in (None, 0),
+        act.get("average_heartrate") in (None, 0),
+        act.get("max_heartrate") in (None, 0),
     ])
     if not need_detail:
         return act
@@ -432,105 +501,85 @@ def enrich_activity_if_needed(token: str, act: dict) -> dict:
     return act
 
 def render_last_run_section(token: str, activities: list, year: int):
-    # Filter runs for selected year and get the most recent by start_date_local
-    run_acts = []
-    for a in activities:
-        if a.get("type") not in ["Run", "VirtualRun"]:
-            continue
-        ts = pd.to_datetime(a.get("start_date_local"), errors="coerce")
-        if pd.isna(ts):
-            continue
-        if getattr(ts, "tz", None) is not None:
-            ts = ts.tz_localize(None)
-        if ts.year == year:
-            run_acts.append((ts, a))
+    runs = get_runs_for_year(activities, year)
 
     st.subheader("Last run")
-    if not run_acts:
+    if not runs:
         st.info(f"No runs found for {year}.")
         return
 
-    run_acts.sort(key=lambda t: t[0])
-    last_ts, last = run_acts[-1]
-    last = enrich_activity_if_needed(token, last)
+    last = get_last_run_for_year(runs)
+    # Enrich the underlying activity if needed and update the last dict
+    # (find the same activity in raw activities to fetch detail)
+    last_raw = next((a for a in activities if a.get("id") == last["id"]), None)
+    if last_raw:
+        last_raw = enrich_activity_if_needed(token, last_raw)
+        # Recompute pace if moving time was filled by detail
+        pace_sec, pace_min_dec, pace_mmss = pace_tuple(last_raw.get("moving_time"), last_raw.get("distance"))
+        last.update({
+            "name": last_raw.get("name") or last.get("name"),
+            "moving_time": last_raw.get("moving_time") or last.get("moving_time"),
+            "elev": last_raw.get("total_elevation_gain") if last_raw.get("total_elevation_gain") is not None else last.get("elev"),
+            "avg_speed": last_raw.get("average_speed") if last_raw.get("average_speed") is not None else last.get("avg_speed"),
+            "avg_hr": last_raw.get("average_heartrate") if last_raw.get("average_heartrate") is not None else last.get("avg_hr"),
+            "max_hr": last_raw.get("max_heartrate") if last_raw.get("max_heartrate") is not None else last.get("max_hr"),
+            "kudos": last_raw.get("kudos_count") if last_raw.get("kudos_count") is not None else last.get("kudos"),
+            "calories": last_raw.get("calories") if last_raw.get("calories") is not None else last.get("calories"),
+            "pace_sec": pace_sec if pace_sec is not None else last.get("pace_sec"),
+        })
 
-    # Extract fields
-    name = last.get("name") or "Run"
-    distance_m = float(last.get("distance") or 0.0)
-    distance_km = distance_m / 1000.0 if distance_m else 0.0
-    moving_s = last.get("moving_time")
-    elapsed_s = last.get("elapsed_time")
-    elev_gain = last.get("total_elevation_gain")
-    avg_speed_kmh = kmh(last.get("average_speed"))
-    max_speed_kmh = kmh(last.get("max_speed"))
-    avg_hr = last.get("average_heartrate")
-    max_hr = last.get("max_heartrate")
-    kudos = last.get("kudos_count")
-    calories = last.get("calories")
+    # Primary KPIs
+    distance_km = last["distance_m"] / 1000.0 if last.get("distance_m") else 0.0
+    pace_sec, pace_min_dec, pace_mmss = pace_tuple(last.get("moving_time"), last.get("distance_m"))
 
-    pace_sec_per_km, pace_min_dec, pace_mmss = pace_tuple(moving_s, distance_m)
-
-    st.write(f"**{name}** — {last_ts.strftime('%Y-%m-%d %H:%M')}")
+    st.write(f"**{last.get('name') or 'Run'}** — {last['ts'].strftime('%Y-%m-%d %H:%M')}")
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Distance", f"{distance_km:.2f} km")
-    k2.metric("Moving time", fmt_secs(moving_s))
-    k3.metric("Elapsed", fmt_secs(elapsed_s))
-    k4.metric("Pace", pace_mmss)
+    k2.metric("Moving time", fmt_secs(last.get("moving_time")))
+    k3.metric("Pace", pace_mmss)
+    k4.metric("Elevation gain", f"{(last.get('elev') or 0):.0f} m")
 
     k5, k6, k7, k8 = st.columns(4)
+    avg_speed_kmh = kmh(last.get("avg_speed"))
     k5.metric("Avg speed", f"{avg_speed_kmh:.1f} km/h" if avg_speed_kmh is not None else "—")
-    k6.metric("Max speed", f"{max_speed_kmh:.1f} km/h" if max_speed_kmh is not None else "—")
-    k7.metric("Elevation gain", f"{elev_gain:.0f} m" if elev_gain is not None else "—")
-    k8.metric("Kudos", f"{kudos}" if kudos is not None else "—")
+    k6.metric("Avg HR", f"{(last.get('avg_hr') or 0):.0f} bpm" if last.get("avg_hr") else "—")
+    k7.metric("Max HR", f"{(last.get('max_hr') or 0):.0f} bpm" if last.get("max_hr") else "—")
+    k8.metric("Calories", f"{(last.get('calories') or 0):.0f} kcal" if last.get("calories") else "—")
 
-    k9, k10, k11, k12 = st.columns(4)
-    k9.metric("Avg HR", f"{avg_hr:.0f} bpm" if avg_hr else "—")
-    k10.metric("Max HR", f"{max_hr:.0f} bpm" if max_hr else "—")
-    k11.metric("Calories", f"{calories:.0f} kcal" if calories else "—")
-    k12.metric("Started", last_ts.strftime("%a %d %b %Y • %H:%M"))
+    # ---- Rankings vs this year ----
+    st.markdown("### Compared to this year")
 
-    # Gauges (pace and speed)
-    c_g1, c_g2 = st.columns(2)
+    # Compute ranks
+    rank_dist, n_dist = rank_metric(runs, "distance_m", last.get("distance_m"), higher_is_better=True)
+    rank_pace, n_pace = rank_metric(runs, "pace_sec", last.get("pace_sec"), higher_is_better=False)  # lower is better
+    rank_elev, n_elev = rank_metric(runs, "elev", last.get("elev"), higher_is_better=True)
+    rank_time, n_time = rank_metric(runs, "moving_time", last.get("moving_time"), higher_is_better=True)
 
-    # Pace gauge — value in MINUTES per km (correct), dynamic axis around value
-    if pace_min_dec is not None:
-        lower = max(3.0, round(pace_min_dec - 2.0, 1))
-        upper = max(lower + 3.0, round(pace_min_dec + 2.0, 1))
-        fig_pace = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=pace_min_dec,  # minutes per km as decimal (correct numeric)
-            number={'suffix': " min/km", 'valueformat': ".2f"},
-            gauge={
-                'axis': {'range': [lower, upper]},
-                'bar': {'color': "#1f77b4"},
-                'steps': [
-                    {'range': [lower, (lower+upper)/2], 'color': '#d5f5e3'},
-                    {'range': [(lower+upper)/2, upper], 'color': '#ffd6cc'}
-                ]
-            },
-            title={'text': f"Pace (also shown as {pace_mmss})"}
-        ))
-        c_g1.plotly_chart(fig_pace, use_container_width=True)
-    else:
-        c_g1.info("Pace gauge: not enough data")
+    p_dist = percentile_from_rank(rank_dist, n_dist)
+    p_pace = percentile_from_rank(rank_pace, n_pace)
+    p_elev = percentile_from_rank(rank_elev, n_elev)
+    p_time = percentile_from_rank(rank_time, n_time)
 
-    # Avg speed gauge (km/h)
-    if avg_speed_kmh is not None:
-        s_upper = max(12.0, round(avg_speed_kmh + 2.0, 1))
-        fig_speed = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=avg_speed_kmh,
-            number={'suffix': " km/h", 'valueformat': ".1f"},
-            gauge={
-                'axis': {'range': [0, s_upper]},
-                'bar': {'color': "#ff7f0e"},
-            },
-            title={'text': "Avg speed"}
-        ))
-        c_g2.plotly_chart(fig_speed, use_container_width=True)
-    else:
-        c_g2.info("Speed gauge: not enough data")
+    c1, c2 = st.columns(2)
+    with c1:
+        if rank_dist:
+            st.write(f"🏁 **Distance:** {ordinal(rank_dist)} longest • {rank_dist}/{n_dist} (top {p_dist:.0f}%)")
+        else:
+            st.write("🏁 **Distance:** —")
+        if rank_pace:
+            st.write(f"⚡ **Pace:** {ordinal(rank_pace)} fastest • {rank_pace}/{n_pace} (top {p_pace:.0f}%)")
+        else:
+            st.write("⚡ **Pace:** —")
+    with c2:
+        if rank_elev:
+            st.write(f"⛰️ **Elevation gain:** {ordinal(rank_elev)} • {rank_elev}/{n_elev} (top {p_elev:.0f}%)")
+        else:
+            st.write("⛰️ **Elevation gain:** —")
+        if rank_time:
+            st.write(f"⏱️ **Moving time:** {ordinal(rank_time)} • {rank_time}/{n_time} (top {p_time:.0f}%)")
+        else:
+            st.write("⏱️ **Moving time:** —")
 
 # =========================
 # Analysis section
@@ -687,7 +736,7 @@ def run():
             ts = datetime.fromisoformat(last_synced).astimezone()
             st.caption(f"Last synced: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-        # === Last run section (rich, no map) ===
+        # === Last run section (with rankings vs year) ===
         render_last_run_section(token, activities, YEAR_SELECTED)
 
         # Chart
