@@ -21,8 +21,41 @@ activities_url = "https://www.strava.com/api/v3/athlete/activities"
 activity_detail_url = "https://www.strava.com/api/v3/activities/{id}"
 
 st.set_page_config(page_title="Strava Progress", layout="wide")
-st.title("🎈 Strava Progress")
-st.caption("Select a year, adjust your goal, sync from Strava (incremental for current year), and explore insights. Includes correct last-run rankings vs this year.")
+
+# =========================
+# Header (image + title)
+# =========================
+def render_header():
+    # You can set your own image via st.secrets["header_image_url"]
+    default_header_img = (
+        "https://images.unsplash.com/photo-1546483875-ad9014c88eba"
+        "?auto=format&fit=crop&w=1600&q=60"
+    )
+    header_image_url = st.secrets.get("header_image_url", default_header_img)
+
+    # Stylish header with image on the left and title/subtitle on the right
+    hcol_img, hcol_txt = st.columns([1, 3])
+    with hcol_img:
+        st.image(
+            header_image_url,
+            caption=None,
+            use_column_width=True,
+        )
+    with hcol_txt:
+        st.markdown(
+            """
+            <div style="padding-left:8px;">
+              <h1 style="margin-bottom:0.2rem;">🏃 Strava Progress</h1>
+              <p style="color:#6c757d; font-size:1.05rem; margin-top:0;">
+                Your yearly goal, progress & insights — now with detailed last‑run stats and ranks.
+              </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown("---")
+
+render_header()
 
 # =========================
 # Sidebar controls
@@ -249,18 +282,27 @@ def fetch_activities_for_year(token: str, year: int, force: bool = False):
 # =========================
 # Backfill missing metrics for ranking (key fix)
 # =========================
-RANK_FIELDS = ["moving_time", "average_speed"]  # we compute pace from moving_time+distance; elev is often zero but valid
+RANK_FIELDS = ["moving_time", "average_speed"]  # pace from moving_time+distance
+
+def get_activity_detail(token: str, activity_id: int | str) -> dict | None:
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        res = requests.get(activity_detail_url.format(id=activity_id), headers=headers, params={"include_all_efforts": "false"})
+        res.raise_for_status()
+        return res.json()
+    except Exception as e:
+        log_warning(f"Could not load activity detail for {activity_id}: {e}")
+        return None
 
 def backfill_metrics_for_selected_year(token: str, year: int, max_details: int = 50):
     """
-    Some cached runs may lack fields needed for ranking (e.g., moving_time, average_speed).
-    We fetch details for those runs only (up to max_details) and persist updates to disk cache.
+    Some cached runs may lack fields needed for ranking. We fetch details for those runs only (up to max_details)
+    and persist updates to disk cache.
     """
     activities_by_id = st.session_state["cache"].get(year, {})
     if not activities_by_id:
         return
 
-    # Collect IDs in selected year with missing key fields
     needs = []
     for aid, a in activities_by_id.items():
         if a.get("type") not in ["Run", "VirtualRun"]:
@@ -278,7 +320,6 @@ def backfill_metrics_for_selected_year(token: str, year: int, max_details: int =
     if not needs:
         return
 
-    # Limit calls to be nice to the API
     needs = needs[:max_details]
     with st.spinner(f"🔧 Backfilling missing metrics for {len(needs)} run(s)…"):
         updated = 0
@@ -287,7 +328,6 @@ def backfill_metrics_for_selected_year(token: str, year: int, max_details: int =
             if not detail:
                 continue
             a = activities_by_id[aid]
-            # Merge only relevant fields
             for k in [
                 "moving_time", "elapsed_time", "total_elevation_gain",
                 "average_speed", "max_speed",
@@ -300,7 +340,6 @@ def backfill_metrics_for_selected_year(token: str, year: int, max_details: int =
             updated += 1
 
         st.session_state["cache"][year] = activities_by_id
-        # Save back to disk
         meta = st.session_state["meta"].get(year, {})
         save_cache_to_disk(year, activities_by_id, meta)
     st.toast("✅ Metrics backfilled for ranking.", icon="✅")
@@ -465,7 +504,7 @@ def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Last run (with rankings vs year)
+# Last run + Rankings vs year
 # =========================
 def get_runs_for_year(activities: list, year: int):
     """Return list of dicts for runs in selected year with computed metrics."""
@@ -509,10 +548,8 @@ def rank_metric(runs: list, key: str, value, higher_is_better: bool = True):
     def valid(v):
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return False
-        # forbid zero/negatives for time/pace where nonsensical
         if key in ("pace_sec", "moving_time") and (not isinstance(v, (int, float)) or v <= 0):
             return False
-        # elevation can be zero and is valid
         return True
 
     vals = [r[key] for r in runs if valid(r.get(key))]
@@ -521,7 +558,6 @@ def rank_metric(runs: list, key: str, value, higher_is_better: bool = True):
         return None, total
 
     vals_sorted = sorted(vals, reverse=higher_is_better)
-    # Find stable rank (handle floats close-equality)
     try:
         idx = vals_sorted.index(value)
     except ValueError:
@@ -549,7 +585,6 @@ def enrich_activity_if_needed(token: str, act: dict) -> dict:
         act.get("calories") in (None, 0),
         act.get("average_heartrate") in (None, 0),
         act.get("max_heartrate") in (None, 0),
-        # elevation can be zero and still valid; don't fetch just for that
     ])
     if not need_detail:
         return act
@@ -580,7 +615,6 @@ def render_last_run_section(token: str, activities: list, year: int):
         return
 
     # Enrich ALL runs that miss core metrics for ranking (if any remain after backfill)
-    # This keeps the ranks accurate even if some older cache entries lacked fields.
     missing_core = [r for r in runs if r.get("moving_time") in (None, 0) or r.get("pace_sec") in (None, 0)]
     if missing_core:
         backfill_metrics_for_selected_year(token, year)
@@ -633,7 +667,6 @@ def render_last_run_section(token: str, activities: list, year: int):
     # ---- Rankings vs this year (corrected) ----
     st.markdown("### Compared to this year")
 
-    # compute ranks on the latest runs list
     rank_dist, n_dist = rank_metric(runs, "distance_m", last.get("distance_m"), higher_is_better=True)
     rank_pace, n_pace = rank_metric(runs, "pace_sec", last.get("pace_sec"), higher_is_better=False)  # lower pace = better
     rank_elev, n_elev = rank_metric(runs, "elev", last.get("elev"), higher_is_better=True)
@@ -797,27 +830,32 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
         st.dataframe(df_progress)
 
 # =========================
-# Run pipeline
+# Run pipeline (with step status & green check marks)
 # =========================
 def run():
     try:
-        with st.spinner("🔐 Authenticating with Strava..."):
-            token = get_access_token()
-        log_success("Access token retrieved.")
+        step = st.container()
+        step_auth = step.empty()
+        step_fetch = step.empty()
+        step_process = step.empty()
 
-        st.write(f"⏳ Checking for activities in {YEAR_SELECTED}…")
+        step_auth.info("🔐 Authenticating with Strava…")
+        token = get_access_token()
+        step_auth.success("✅ Authenticated")
+
+        step_fetch.info(f"⏳ Checking for activities in {YEAR_SELECTED}…")
         activities = fetch_activities_for_year(token, YEAR_SELECTED, force=force_refresh)
-        log_success(f"Cached activities for {YEAR_SELECTED}: {len(activities)}")
+        step_fetch.success(f"✅ Activities checked (cache now has {len(activities)} activities for {YEAR_SELECTED})")
 
-        # NEW: backfill missing metrics used for rankings if needed (once per year)
+        # Backfill missing metrics for rankings (runs only; once per year if needed)
         backfill_metrics_for_selected_year(token, YEAR_SELECTED)
-
         # Refresh activities after backfill so downstream sees updated values
         activities = list(st.session_state["cache"].get(YEAR_SELECTED, {}).values())
 
-        st.write("🧮 Processing runs…")
+        step_process.info("🧮 Processing runs…")
         df_activities = process_activities(activities, YEAR_SELECTED)
         df_progress = build_progress(df_activities, YEAR_GOAL_KM, YEAR_SELECTED)
+        step_process.success("✅ Processing complete")
 
         # Last update info
         last_synced = st.session_state.get("meta", {}).get(YEAR_SELECTED, {}).get("last_synced_utc")
@@ -833,6 +871,9 @@ def run():
 
         # Analysis
         compute_analysis(df_progress, activities, YEAR_GOAL_KM, YEAR_SELECTED)
+
+        # Final "updated" banner
+        st.success(f"✅ Updated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     except Exception as e:
         log_error(f"Something went wrong: {e}")
