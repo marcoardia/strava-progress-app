@@ -40,7 +40,7 @@ with st.sidebar:
         "Yearly goal (km)",
         min_value=100,
         max_value=10000,
-        value=500,
+        value=1000,
         step=50,
         help="Target total kilometers for the selected year.",
     )
