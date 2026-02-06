@@ -36,7 +36,7 @@ ACTIVITY_MODES = {
         "default_goal": 1000,
     },
     "Walk": {
-        "types": ["Walk"],  # focusing strictly on Walks
+        "types": ["Walk","Hike"],  # focusing strictly on Walks
         "emoji": "🚶",
         "noun": "walk",
         "plural": "walks",
@@ -82,16 +82,6 @@ def render_header():
 
 render_header()
 
-# ================
-# BIG mode switch
-# ================
-mode = st.session_state["activity_mode"]
-switch_label = "🚶 Switch to Walks" if mode == "Run" else "🏃 Switch to Runs"
-if st.button(switch_label, type="primary", use_container_width=True):
-    mode = "Walk" if mode == "Run" else "Run"
-    st.session_state["activity_mode"] = mode
-st.caption(f"Mode: {ACTIVITY_MODES[mode]['emoji']} {mode}")
-
 # =========================
 # Sidebar controls
 # =========================
@@ -99,6 +89,22 @@ current_year = datetime.now().year
 years_options = list(range(2015, current_year + 1))
 with st.sidebar:
     st.header("Settings")
+
+    # --- NEW: activity selector in the sidebar ---
+    if "activity_mode" not in st.session_state:
+        st.session_state["activity_mode"] = "Run"
+    activity_mode = st.radio(
+        "Activity",
+        options=["Run", "Walk"],
+        index=0 if st.session_state["activity_mode"] == "Run" else 1,
+        format_func=lambda x: "🏃 Runs" if x == "Run" else "🚶 Walks",
+        help="Choose which activity type to analyze.",
+    )
+    # store back
+    st.session_state["activity_mode"] = activity_mode
+    mode_cfg = ACTIVITY_MODES[activity_mode]
+    st.caption(f"Mode: {mode_cfg['emoji']} {activity_mode}")
+
     YEAR_SELECTED = st.selectbox(
         "Year",
         options=years_options,
@@ -107,16 +113,16 @@ with st.sidebar:
     )
 
     # Maintain separate yearly goals per mode
-    goal_key = f"year_goal_km_{mode.lower()}"
+    goal_key = f"year_goal_km_{activity_mode.lower()}"
     if goal_key not in st.session_state:
-        st.session_state[goal_key] = ACTIVITY_MODES[mode]["default_goal"]
+        st.session_state[goal_key] = ACTIVITY_MODES[activity_mode]["default_goal"]
     YEAR_GOAL_KM = st.slider(
         "Yearly goal (km)",
         min_value=100,
         max_value=10000,
         value=st.session_state[goal_key],
         step=10,
-        help=f"Target total kilometers for {mode.lower()}s in the selected year.",
+        help=f"Target total kilometers for {activity_mode.lower()}s in the selected year.",
     )
     st.session_state[goal_key] = YEAR_GOAL_KM
 
@@ -866,7 +872,8 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
 # Run pipeline (with step status & green check marks)
 # =========================
 def run():
-    mode_cfg = ACTIVITY_MODES[st.session_state["activity_mode"]]
+    mode = st.session_state["activity_mode"]
+    mode_cfg = ACTIVITY_MODES[mode]
     try:
         step = st.container()
         step_auth = step.empty()
@@ -881,48 +888,36 @@ def run():
         activities = fetch_activities_for_year(token, YEAR_SELECTED, force=force_refresh)
         step_fetch.success(f"✅ Activities checked (cache now has {len(activities)} activities for {YEAR_SELECTED})")
 
-        # Backfill missing metrics for rankings (selected mode only; once per year if needed)
+        
+# backfill only for selected types
         backfill_metrics_for_selected_year(token, YEAR_SELECTED, mode_cfg["types"])
-        # Refresh activities after backfill so downstream sees updated values
         activities = list(st.session_state["cache"].get(YEAR_SELECTED, {}).values())
 
-        step_process.info(f"🧮 Processing {mode_cfg['plural']}…")
+        # build df for selected types
         df_activities = process_activities(activities, YEAR_SELECTED, mode_cfg["types"])
-        df_progress = build_progress(df_activities, st.session_state[f"year_goal_km_{mode_cfg['noun']}"] if f"year_goal_km_{mode_cfg['noun']}" in st.session_state else 0, YEAR_SELECTED)
 
-        # The slider value already stored in session; use it directly to avoid key mismatch
-        year_goal_val = st.session_state.get(f"year_goal_km_{st.session_state['activity_mode'].lower()}", mode_cfg["default_goal"])
+        # use the per-mode goal from sidebar
+        year_goal_val = st.session_state.get(f"year_goal_km_{mode.lower()}", mode_cfg["default_goal"])
         df_progress = build_progress(df_activities, year_goal_val, YEAR_SELECTED)
 
-        step_process.success("✅ Processing complete")
-
-        # Last update info
-        last_synced = st.session_state.get("meta", {}).get(YEAR_SELECTED, {}).get("last_synced_utc")
-        if last_synced:
-            ts = datetime.fromisoformat(last_synced).astimezone()
-            st.caption(f"Last synced: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-
-        # === Last activity section (with rankings) ===
+        # last activity (run/walk)
         render_last_activity_section(token, activities, YEAR_SELECTED, mode_cfg)
 
-        # Chart
+        # chart + analysis
         render_chart(
             df_progress,
             year_goal_val,
             chart_view,
             YEAR_SELECTED,
-            mode_label=f"{mode_cfg['emoji']} {st.session_state['activity_mode']}",
+            mode_label=f"{mode_cfg['emoji']} {mode}",
             actual_color=mode_cfg["color"],
         )
-
-        # Analysis
         compute_analysis(df_progress, activities, year_goal_val, YEAR_SELECTED, mode_cfg)
 
-        # Final "updated" banner
         st.success(f"✅ Updated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
     except Exception as e:
         log_error(f"Something went wrong: {e}")
         st.error(f"Something went wrong: {e}")
+
 
 run()
