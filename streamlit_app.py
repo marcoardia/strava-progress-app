@@ -24,16 +24,38 @@ curdir = os.path.dirname(os.path.realpath(__file__))
 st.set_page_config(page_title="Strava Progress", layout="wide")
 
 # =========================
+# Activity modes (Run / Walk)
+# =========================
+ACTIVITY_MODES = {
+    "Run": {
+        "types": ["Run", "VirtualRun"],
+        "emoji": "🏃",
+        "noun": "run",
+        "plural": "runs",
+        "color": "#1f77b4",
+        "default_goal": 1000,
+    },
+    "Walk": {
+        "types": ["Walk"],  # focusing strictly on Walks
+        "emoji": "🚶",
+        "noun": "walk",
+        "plural": "walks",
+        "color": "#ff7f0e",
+        "default_goal": 1500,
+    },
+}
+if "activity_mode" not in st.session_state:
+    st.session_state["activity_mode"] = "Run"
+
+# =========================
 # Header (image + title)
 # =========================
 def render_header():
-    # You can set your own image via st.secrets["header_image_url"]
     default_header_img = (
         "https://images.unsplash.com/photo-1546483875-ad9014c88eba"
         "?auto=format&fit=crop&w=1600&q=60"
     )
     img = curdir + "/" + st.secrets["header_image_url"]
-    #header_image_url = st.secrets.get("header_image_url", default_header_img)
     header_image_url = img
 
     # Stylish header with image on the left and title/subtitle on the right
@@ -60,6 +82,16 @@ def render_header():
 
 render_header()
 
+# ================
+# BIG mode switch
+# ================
+mode = st.session_state["activity_mode"]
+switch_label = "🚶 Switch to Walks" if mode == "Run" else "🏃 Switch to Runs"
+if st.button(switch_label, type="primary", use_container_width=True):
+    mode = "Walk" if mode == "Run" else "Run"
+    st.session_state["activity_mode"] = mode
+st.caption(f"Mode: {ACTIVITY_MODES[mode]['emoji']} {mode}")
+
 # =========================
 # Sidebar controls
 # =========================
@@ -73,14 +105,21 @@ with st.sidebar:
         index=len(years_options) - 1,
         help="Choose the year to analyze."
     )
+
+    # Maintain separate yearly goals per mode
+    goal_key = f"year_goal_km_{mode.lower()}"
+    if goal_key not in st.session_state:
+        st.session_state[goal_key] = ACTIVITY_MODES[mode]["default_goal"]
     YEAR_GOAL_KM = st.slider(
         "Yearly goal (km)",
         min_value=100,
         max_value=10000,
-        value=1000,  # default 1000 km
+        value=st.session_state[goal_key],
         step=10,
-        help="Target total kilometers for the selected year.",
+        help=f"Target total kilometers for {mode.lower()}s in the selected year.",
     )
+    st.session_state[goal_key] = YEAR_GOAL_KM
+
     chart_view = st.radio(
         "Chart view",
         options=["Cumulative", "Daily"],
@@ -287,19 +326,9 @@ def fetch_activities_for_year(token: str, year: int, force: bool = False):
 # =========================
 RANK_FIELDS = ["moving_time", "average_speed"]  # pace from moving_time+distance
 
-def get_activity_detail(token: str, activity_id: int | str) -> dict | None:
-    try:
-        headers = {"Authorization": f"Bearer {token}"}
-        res = requests.get(activity_detail_url.format(id=activity_id), headers=headers, params={"include_all_efforts": "false"})
-        res.raise_for_status()
-        return res.json()
-    except Exception as e:
-        log_warning(f"Could not load activity detail for {activity_id}: {e}")
-        return None
-
-def backfill_metrics_for_selected_year(token: str, year: int, max_details: int = 50):
+def backfill_metrics_for_selected_year(token: str, year: int, allowed_types: list[str], max_details: int = 50):
     """
-    Some cached runs may lack fields needed for ranking. We fetch details for those runs only (up to max_details)
+    Some cached activities may lack fields needed for ranking. We fetch details for those only (up to max_details)
     and persist updates to disk cache.
     """
     activities_by_id = st.session_state["cache"].get(year, {})
@@ -308,7 +337,7 @@ def backfill_metrics_for_selected_year(token: str, year: int, max_details: int =
 
     needs = []
     for aid, a in activities_by_id.items():
-        if a.get("type") not in ["Run", "VirtualRun"]:
+        if a.get("type") not in allowed_types:
             continue
         ts = pd.to_datetime(a.get("start_date_local"), errors="coerce")
         if pd.isna(ts):
@@ -324,7 +353,7 @@ def backfill_metrics_for_selected_year(token: str, year: int, max_details: int =
         return
 
     needs = needs[:max_details]
-    with st.spinner(f"🔧 Backfilling missing metrics for {len(needs)} run(s)…"):
+    with st.spinner(f"🔧 Backfilling missing metrics for {len(needs)} activity(ies)…"):
         updated = 0
         for aid in needs:
             detail = get_activity_detail(token, aid)
@@ -350,24 +379,25 @@ def backfill_metrics_for_selected_year(token: str, year: int, max_details: int =
 # =========================
 # Transformations (tz-naive dates)
 # =========================
-def process_activities(activities: list, year: int) -> pd.DataFrame:
+def process_activities(activities: list, year: int, allowed_types: list[str]) -> pd.DataFrame:
     """
-    Aggregate runs/virtual runs by local date within selected year, distance in km.
+    Aggregate selected activity types by local date within selected year, distance in km.
     Returns DataFrame with columns: date (Timestamp, tz-naive), distance.
     """
     rows = []
     for act in activities:
-        if act.get("type") in ["Run", "VirtualRun"]:
-            start_local_ts = pd.to_datetime(act.get("start_date_local"), errors="coerce")
-            if pd.isna(start_local_ts):
-                continue
-            if getattr(start_local_ts, "tz", None) is not None:
-                start_local_ts = start_local_ts.tz_localize(None)
-            if start_local_ts.year != year:
-                continue
-            start_local_ts = start_local_ts.normalize()
-            dist_km = float(act.get("distance", 0.0)) / 1000.0
-            rows.append({"date": start_local_ts, "distance": dist_km})
+        if act.get("type") not in allowed_types:
+            continue
+        start_local_ts = pd.to_datetime(act.get("start_date_local"), errors="coerce")
+        if pd.isna(start_local_ts):
+            continue
+        if getattr(start_local_ts, "tz", None) is not None:
+            start_local_ts = start_local_ts.tz_localize(None)
+        if start_local_ts.year != year:
+            continue
+        start_local_ts = start_local_ts.normalize()
+        dist_km = float(act.get("distance", 0.0)) / 1000.0
+        rows.append({"date": start_local_ts, "distance": dist_km})
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -451,7 +481,7 @@ def ordinal(n: int) -> str:
 # =========================
 # Visualization (chart)
 # =========================
-def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year: int):
+def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year: int, mode_label: str, actual_color: str):
     if df_progress.empty:
         st.info("No data to display yet.")
         return
@@ -462,7 +492,7 @@ def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year
         df_progress["date"] = df_progress["date"].dt.tz_localize(None)
 
     if view == "Cumulative":
-        st.subheader(f"Cumulative Goal vs. Actuals — {year} (Target: {year_goal_km} km)")
+        st.subheader(f"{mode_label} — Cumulative Goal vs. Actuals — {year} (Target: {year_goal_km} km)")
         bar_series = df_progress["diff"]
         line_goal = df_progress["goal_cum"]
         line_actual = df_progress["actual_cum"]
@@ -471,7 +501,7 @@ def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year
         line_goal_name = "Target (cum)"
         line_actual_name = "Actual (cum)"
     else:
-        st.subheader(f"Daily Goal vs. Actuals — {year} (Target: {year_goal_km} km)")
+        st.subheader(f"{mode_label} — Daily Goal vs. Actuals — {year} (Target: {year_goal_km} km)")
         bar_series = df_progress["diff_day"]
         line_goal = df_progress["goal"]
         line_actual = df_progress["distance"]
@@ -493,7 +523,7 @@ def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year
     ))
     fig.add_trace(go.Scatter(
         x=df_progress["date"], y=line_actual, name=line_actual_name,
-        mode="lines", line=dict(color="#1f77b4", width=3)
+        mode="lines", line=dict(color=actual_color, width=3)
     ))
     fig.update_layout(
         barmode="overlay",
@@ -507,13 +537,13 @@ def render_chart(df_progress: pd.DataFrame, year_goal_km: float, view: str, year
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Last run + Rankings vs year
+# Last activity + Rankings vs year
 # =========================
-def get_runs_for_year(activities: list, year: int):
-    """Return list of dicts for runs in selected year with computed metrics."""
-    runs = []
+def get_activities_for_year(activities: list, year: int, allowed_types: list[str]):
+    """Return list of dicts for selected activities in year with computed metrics."""
+    items = []
     for a in activities:
-        if a.get("type") not in ["Run", "VirtualRun"]:
+        if a.get("type") not in allowed_types:
             continue
         ts = pd.to_datetime(a.get("start_date_local"), errors="coerce")
         if pd.isna(ts):
@@ -527,7 +557,7 @@ def get_runs_for_year(activities: list, year: int):
         elev = a.get("total_elevation_gain")
         avg_speed = a.get("average_speed")
         pace_sec, pace_min_dec, _ = pace_tuple(moving_time, distance_m)
-        runs.append({
+        items.append({
             "id": a.get("id"),
             "ts": ts,
             "name": a.get("name"),
@@ -541,11 +571,11 @@ def get_runs_for_year(activities: list, year: int):
             "kudos": a.get("kudos_count"),
             "calories": a.get("calories"),
         })
-    return runs
+    return items
 
-def rank_metric(runs: list, key: str, value, higher_is_better: bool = True):
+def rank_metric(items: list, key: str, value, higher_is_better: bool = True):
     """
-    1-based rank and total N using only runs with a valid, non-null metric.
+    1-based rank and total N using only activities with a valid, non-null metric.
     For pace (seconds per km), lower is better → higher_is_better=False
     """
     def valid(v):
@@ -555,7 +585,7 @@ def rank_metric(runs: list, key: str, value, higher_is_better: bool = True):
             return False
         return True
 
-    vals = [r[key] for r in runs if valid(r.get(key))]
+    vals = [r[key] for r in items if valid(r.get(key))]
     total = len(vals)
     if total == 0 or not valid(value):
         return None, total
@@ -574,14 +604,14 @@ def percentile_from_rank(rank: int | None, total: int) -> float | None:
         return None
     return (rank / total) * 100.0
 
-def get_last_run_for_year(runs: list):
-    if not runs:
+def get_last_item_for_year(items: list):
+    if not items:
         return None
-    runs_sorted = sorted(runs, key=lambda r: r["ts"])
-    return runs_sorted[-1]
+    items_sorted = sorted(items, key=lambda r: r["ts"])
+    return items_sorted[-1]
 
 def enrich_activity_if_needed(token: str, act: dict) -> dict:
-    """Bring in more fields for last run if missing."""
+    """Bring in more fields for last item if missing."""
     need_detail = any([
         act.get("moving_time") in (None, 0),
         act.get("average_speed") in (None, 0),
@@ -609,25 +639,25 @@ def enrich_activity_if_needed(token: str, act: dict) -> dict:
     act.update({k: v for k, v in merge_fields.items() if v is not None})
     return act
 
-def render_last_run_section(token: str, activities: list, year: int):
-    runs = get_runs_for_year(activities, year)
+def render_last_activity_section(token: str, activities: list, year: int, mode_cfg: dict):
+    items = get_activities_for_year(activities, year, mode_cfg["types"])
 
-    st.subheader("Last run")
-    if not runs:
-        st.info(f"No runs found for {year}.")
+    st.subheader(f"Last {mode_cfg['noun']}")
+    if not items:
+        st.info(f"No {mode_cfg['plural']} found for {year}.")
         return
 
-    # Enrich ALL runs that miss core metrics for ranking (if any remain after backfill)
-    missing_core = [r for r in runs if r.get("moving_time") in (None, 0) or r.get("pace_sec") in (None, 0)]
+    # Enrich ALL items that miss core metrics for ranking (if any remain after backfill)
+    missing_core = [r for r in items if r.get("moving_time") in (None, 0) or r.get("pace_sec") in (None, 0)]
     if missing_core:
-        backfill_metrics_for_selected_year(token, year)
-        # Rebuild runs after backfill
+        backfill_metrics_for_selected_year(token, year, mode_cfg["types"])
+        # Rebuild items after backfill
         activities = list(st.session_state["cache"].get(year, {}).values())
-        runs = get_runs_for_year(activities, year)
+        items = get_activities_for_year(activities, year, mode_cfg["types"])
 
-    last = get_last_run_for_year(runs)
+    last = get_last_item_for_year(items)
 
-    # Also enrich the specific last run if needed (to show richer KPIs)
+    # Also enrich the specific last item if needed (to show richer KPIs)
     last_raw = next((a for a in activities if a.get("id") == last["id"]), None)
     if last_raw:
         last_raw = enrich_activity_if_needed(token, last_raw)
@@ -650,9 +680,9 @@ def render_last_run_section(token: str, activities: list, year: int):
 
     # Primary KPIs
     distance_km = last["distance_m"] / 1000.0 if last.get("distance_m") else 0.0
-    pace_sec, _, pace_mmss = pace_tuple(last.get("moving_time"), last.get("distance_m"))
+    _, _, pace_mmss = pace_tuple(last.get("moving_time"), last.get("distance_m"))
 
-    st.write(f"**{last.get('name') or 'Run'}** — {last['ts'].strftime('%Y-%m-%d %H:%M')}")
+    st.write(f"**{last.get('name') or mode_cfg['noun'].capitalize()}** — {last['ts'].strftime('%Y-%m-%d %H:%M')}")
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Distance", f"{distance_km:.2f} km")
@@ -667,13 +697,13 @@ def render_last_run_section(token: str, activities: list, year: int):
     k7.metric("Max HR", f"{(last.get('max_hr') or 0):.0f} bpm" if last.get("max_hr") else "—")
     k8.metric("Calories", f"{(last.get('calories') or 0):.0f} kcal" if last.get("calories") else "—")
 
-    # ---- Rankings vs this year (corrected) ----
+    # ---- Rankings vs this year ----
     st.markdown("### Compared to this year")
 
-    rank_dist, n_dist = rank_metric(runs, "distance_m", last.get("distance_m"), higher_is_better=True)
-    rank_pace, n_pace = rank_metric(runs, "pace_sec", last.get("pace_sec"), higher_is_better=False)  # lower pace = better
-    rank_elev, n_elev = rank_metric(runs, "elev", last.get("elev"), higher_is_better=True)
-    rank_time, n_time = rank_metric(runs, "moving_time", last.get("moving_time"), higher_is_better=True)
+    rank_dist, n_dist = rank_metric(items, "distance_m", last.get("distance_m"), higher_is_better=True)
+    rank_pace, n_pace = rank_metric(items, "pace_sec", last.get("pace_sec"), higher_is_better=False)  # lower pace = better
+    rank_elev, n_elev = rank_metric(items, "elev", last.get("elev"), higher_is_better=True)
+    rank_time, n_time = rank_metric(items, "moving_time", last.get("moving_time"), higher_is_better=True)
 
     p_dist = percentile_from_rank(rank_dist, n_dist)
     p_pace = percentile_from_rank(rank_pace, n_pace)
@@ -703,9 +733,9 @@ def render_last_run_section(token: str, activities: list, year: int):
 # =========================
 # Analysis section
 # =========================
-def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: float, year: int):
+def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: float, year: int, mode_cfg: dict):
     if df_progress.empty:
-        st.info("No analysis yet — no runs recorded.")
+        st.info(f"No analysis yet — no {mode_cfg['plural']} recorded.")
         return
 
     latest = df_progress.iloc[-1]
@@ -713,9 +743,9 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
     diff_km = float(latest["diff"])
 
     # Counts (filter activities to selected year using start_date_local)
-    run_acts = []
+    selected_acts = []
     for a in activities:
-        if a.get("type") not in ["Run", "VirtualRun"]:
+        if a.get("type") not in mode_cfg["types"]:
             continue
         ts = pd.to_datetime(a.get("start_date_local"), errors="coerce")
         if pd.isna(ts):
@@ -723,18 +753,18 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
         if getattr(ts, "tz", None) is not None:
             ts = ts.tz_localize(None)
         if ts.year == year:
-            run_acts.append(a)
-    run_count = len(run_acts)
+            selected_acts.append(a)
+    act_count = len(selected_acts)
 
-    # Unique run days
+    # Unique active days
     df_days = df_progress[df_progress["distance"] > 0.0]
-    run_days = int((df_days["date"]).nunique())
+    active_days = int((df_days["date"]).nunique())
 
-    # Longest single run (by activity)
+    # Longest single activity (by activity)
     longest_km = 0.0
     longest_date = None
-    if run_acts:
-        longest = max(run_acts, key=lambda x: float(x.get("distance", 0.0)))
+    if selected_acts:
+        longest = max(selected_acts, key=lambda x: float(x.get("distance", 0.0)))
         longest_km = float(longest.get("distance", 0.0)) / 1000.0
         longest_date = pd.to_datetime(longest.get("start_date_local")).date()
 
@@ -747,25 +777,25 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
     best_week_km = float(df_weekly["km"].max()) if not df_weekly.empty else 0.0
 
     # Streaks (days with distance > 0)
-    dates_with_run = sorted([pd.to_datetime(d).date() for d in df_days["date"].tolist()])
+    dates_with = sorted([pd.to_datetime(d).date() for d in df_days["date"].tolist()])
     best_streak = 0
     current_streak = 0
-    if dates_with_run:
+    if dates_with:
         streak = 1
         best_streak = 1
-        for i in range(1, len(dates_with_run)):
-            if dates_with_run[i] == dates_with_run[i - 1] + timedelta(days=1):
+        for i in range(1, len(dates_with)):
+            if dates_with[i] == dates_with[i - 1] + timedelta(days=1):
                 streak += 1
             else:
                 best_streak = max(best_streak, streak)
                 streak = 1
         best_streak = max(best_streak, streak)
 
-        last_date = dates_with_run[-1]
+        last_date = dates_with[-1]
         if year == current_year and last_date == datetime.now().date():
             cs = 1
-            for i in range(len(dates_with_run) - 2, -1, -1):
-                if dates_with_run[i] == dates_with_run[i + 1] - timedelta(days=1):
+            for i in range(len(dates_with) - 2, -1, -1):
+                if dates_with[i] == dates_with[i + 1] - timedelta(days=1):
                     cs += 1
                 else:
                     break
@@ -794,12 +824,12 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total distance (YTD)", f"{total_km:.1f} km")
-    c2.metric("Runs", f"{run_count}")
-    c3.metric("Active days", f"{run_days}")
+    c2.metric(mode_cfg["plural"].capitalize(), f"{act_count}")
+    c3.metric("Active days", f"{active_days}")
     c4.metric("Ahead/Behind", f"{diff_km:+.1f} km ({days_ahead_equiv:+.1f} days)")
 
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Longest run", f"{longest_km:.1f} km", f"{longest_date}" if longest_date else None)
+    c5.metric(f"Longest {mode_cfg['noun']}", f"{longest_km:.1f} km", f"{longest_date}" if longest_date else None)
     c6.metric("Best week total", f"{best_week_km:.1f} km")
     c7.metric("Current streak", f"{current_streak} days")
     c8.metric("Req. avg/day to hit goal", f"{required_avg_per_day:.2f} km")
@@ -836,6 +866,7 @@ def compute_analysis(df_progress: pd.DataFrame, activities: list, year_goal_km: 
 # Run pipeline (with step status & green check marks)
 # =========================
 def run():
+    mode_cfg = ACTIVITY_MODES[st.session_state["activity_mode"]]
     try:
         step = st.container()
         step_auth = step.empty()
@@ -850,14 +881,19 @@ def run():
         activities = fetch_activities_for_year(token, YEAR_SELECTED, force=force_refresh)
         step_fetch.success(f"✅ Activities checked (cache now has {len(activities)} activities for {YEAR_SELECTED})")
 
-        # Backfill missing metrics for rankings (runs only; once per year if needed)
-        backfill_metrics_for_selected_year(token, YEAR_SELECTED)
+        # Backfill missing metrics for rankings (selected mode only; once per year if needed)
+        backfill_metrics_for_selected_year(token, YEAR_SELECTED, mode_cfg["types"])
         # Refresh activities after backfill so downstream sees updated values
         activities = list(st.session_state["cache"].get(YEAR_SELECTED, {}).values())
 
-        step_process.info("🧮 Processing runs…")
-        df_activities = process_activities(activities, YEAR_SELECTED)
-        df_progress = build_progress(df_activities, YEAR_GOAL_KM, YEAR_SELECTED)
+        step_process.info(f"🧮 Processing {mode_cfg['plural']}…")
+        df_activities = process_activities(activities, YEAR_SELECTED, mode_cfg["types"])
+        df_progress = build_progress(df_activities, st.session_state[f"year_goal_km_{mode_cfg['noun']}"] if f"year_goal_km_{mode_cfg['noun']}" in st.session_state else 0, YEAR_SELECTED)
+
+        # The slider value already stored in session; use it directly to avoid key mismatch
+        year_goal_val = st.session_state.get(f"year_goal_km_{st.session_state['activity_mode'].lower()}", mode_cfg["default_goal"])
+        df_progress = build_progress(df_activities, year_goal_val, YEAR_SELECTED)
+
         step_process.success("✅ Processing complete")
 
         # Last update info
@@ -866,14 +902,21 @@ def run():
             ts = datetime.fromisoformat(last_synced).astimezone()
             st.caption(f"Last synced: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-        # === Last run section (with correct rankings) ===
-        render_last_run_section(token, activities, YEAR_SELECTED)
+        # === Last activity section (with rankings) ===
+        render_last_activity_section(token, activities, YEAR_SELECTED, mode_cfg)
 
         # Chart
-        render_chart(df_progress, YEAR_GOAL_KM, chart_view, YEAR_SELECTED)
+        render_chart(
+            df_progress,
+            year_goal_val,
+            chart_view,
+            YEAR_SELECTED,
+            mode_label=f"{mode_cfg['emoji']} {st.session_state['activity_mode']}",
+            actual_color=mode_cfg["color"],
+        )
 
         # Analysis
-        compute_analysis(df_progress, activities, YEAR_GOAL_KM, YEAR_SELECTED)
+        compute_analysis(df_progress, activities, year_goal_val, YEAR_SELECTED, mode_cfg)
 
         # Final "updated" banner
         st.success(f"✅ Updated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
